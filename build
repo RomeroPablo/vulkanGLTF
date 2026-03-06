@@ -1,0 +1,17 @@
+#!/bin/sh
+
+if [ "$1" = "clean" ]; then
+    rm -rf artifacts shaders
+    exit 0
+fi
+
+if [ artifacts/shaders -ot main.cpp ] || [ artifacts/shaders -ot lib.hpp ]; then
+    mkdir -p artifacts
+    echo "compiling..."
+    bear --output artifacts/compile_commands.json -- \
+        g++ -std=c++23 -g -O0 main.cpp -lvulkan $(sdl2-config --cflags --libs) \
+        -o artifacts/shaders
+fi
+
+mv ./artifacts/shaders .
+./shaders
