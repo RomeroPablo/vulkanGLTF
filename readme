@@ -1,13 +1,6 @@
-Vulkan 1.0 Live Shader Editor
+Vulkan 1.0 GLTF Demo
 
 depends on
     <Vulkan>
     <SDL2>
-    !glslc
-
-TODO
-    GPU Metadata
-    Kernel Performance
-    Framebuffer Resize
-    Port To Windows (build system + posix calls)
-    Better Path Handling
+    <glslc>

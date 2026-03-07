@@ -43,6 +43,8 @@
 #include "lib.hpp"
 #include <glm/glm.hpp>
 
+#include "external/tiny_gltf.h"
+
 namespace fs = std::filesystem;
 
 static fs::file_time_type getFileTimestamp(const char* path) {
@@ -166,6 +168,9 @@ struct State{
     } move;
 
     bool enable_input = true;
+
+    tinygltf::Model model;
+
     void initVulkan();
     void setExtensions();
     void setLayers();
@@ -175,6 +180,7 @@ struct State{
 
     void initDevice();
     void initFramebuffer();
+    void initGltf();
     void initShaders();
     void initUniforms();
     void buildPipeline(VkShaderModule fragModule);
@@ -521,6 +527,11 @@ uint32_t State::findMemoryType(VkMemoryPropertyFlags f, uint32_t typeFilter){
     return UINT32_MAX;
 };
 
+#define MODEL_PATH "external/daybreak.glb"
+void State::initGltf(){
+
+};
+
 void State::initShaders(){
     const std::string fragPath = "artifacts/frag.spv";
     const std::string vertPath = "artifacts/vert.spv";
@@ -565,7 +576,7 @@ void State::initShaders(){
         {{ 1.0,-1.0, 0.0},{1.0,1.0,1.0}},
     };
     if(enable_input){
-        vertices = GenerateSphere(1.0, 32, 32);
+        vertices = GenerateSphere(1.0, 4, 32);
     }
 
     vBindingDescription = {
@@ -893,6 +904,7 @@ void State::initVulkan(){
     initDevice();
     initFramebuffer();
     initResources();
+    initGltf();
     initShaders();
     buildPipeline(fragModule);
     initUniforms();
