@@ -1,5 +1,6 @@
 #include "SDL_keyboard.h"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <glm/glm.hpp>
 #include <glm/common.hpp>
 #include <glm/detail/qualifier.hpp>
 #include <glm/ext/matrix_clip_space.hpp>
@@ -15,6 +17,8 @@
 #include <glm/ext/vector_float3.hpp>
 #include <glm/geometric.hpp>
 #include <glm/trigonometric.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <iostream>
 #include <numeric>
@@ -41,28 +45,22 @@
 #include <vulkan/vulkan_core.h>
 
 #include "lib.hpp"
-#include <glm/glm.hpp>
+#include "gltf.hpp"
 
-#include "external/tiny_gltf.h"
-
-namespace fs = std::filesystem;
-
-static fs::file_time_type getFileTimestamp(const char* path) {
+static std::filesystem::file_time_type getFileTimestamp(const char* path) {
     std::error_code ec;
-    fs::file_time_type ts = fs::last_write_time(path, ec);
+    std::filesystem::file_time_type ts = std::filesystem::last_write_time(path, ec);
     if (ec) {
-        return fs::file_time_type::min();
+        return std::filesystem::file_time_type::min();
     }
     return ts;
 }
-
-//using vec4 = float[4];
-//using mat4 = vec4[4];
 
 struct alignas(16) MVP {
     glm::mat4 model;
     glm::mat4 view;
     glm::mat4 proj;
+    glm::vec4 camPos;
 };
 
 struct PushConstants{
@@ -71,13 +69,31 @@ struct PushConstants{
     float _pad;
 };
 
+struct alignas(16) MaterialParams {
+    glm::vec4 baseColorFactor{1.0f};
+    glm::vec4 emissiveFactor{0.0f, 0.0f, 0.0f, 1.0f};
+    float metallicFactor{1.0f};
+    float roughnessFactor{1.0f};
+    float normalScale{1.0f};
+    float occlusionStrength{1.0f};
+    float alphaCutoff{0.5f};
+    int alphaMode{0}; // 0: OPAQUE, 1: MASK, 2: BLEND
+    int hasBaseColorTexture{0};
+    int hasMetallicRoughnessTexture{0};
+    int hasNormalTexture{0};
+    int hasOcclusionTexture{0};
+    int hasEmissiveTexture{0};
+};
+
 struct State{
     const char* shaderFragPath = "kernels/shader.frag";
     const char* shaderVertPath = "kernels/shader.vert";
-    fs::file_time_type fragTs{};
+    const char* gltfFragPath = "kernels/new_gltf.frag";
+    const char* gltfVertPath = "kernels/gltf.vert";
+    std::filesystem::file_time_type fragTs{};
     SDL_Window* window;
-    uint32_t width = 640;
-    uint32_t height = 640;
+    uint32_t width = 3840;
+    uint32_t height = 2160;
     bool running = true;
     std::chrono::time_point<std::chrono::steady_clock> tStart{}, tEnd{};
     std::chrono::duration<float> runtime{};
@@ -110,6 +126,10 @@ struct State{
     VkSurfaceTransformFlagBitsKHR swapchainTransform;
     VkCompositeAlphaFlagBitsKHR swapchainAlpha;
     VkPresentModeKHR swapchainPresentMode;
+    VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+    std::vector<VkImage> depthImages;
+    std::vector<VkDeviceMemory> depthImageMemory;
+    std::vector<VkImageView> depthImageViews;
 
     VkRenderPass renderPass;
     std::vector<VkAttachmentDescription> attachmentDescriptions;
@@ -118,14 +138,18 @@ struct State{
 
     std::vector<VkFramebuffer> framebuffers;
 
-    VkPipelineLayout shaderPipelineLayout;
-    VkPipeline shaderPipeline;
+    VkPipelineLayout shaderPipelineLayout{VK_NULL_HANDLE};
+    VkPipeline shaderPipeline{VK_NULL_HANDLE};
+    VkPipelineLayout gltfPipelineLayout{VK_NULL_HANDLE};
+    VkPipeline gltfPipeline{VK_NULL_HANDLE};
 
     VkViewport viewport;
     VkRect2D scissor;
 
     VkShaderModule fragModule;
     VkShaderModule vertModule;
+    VkShaderModule gltfFragModule{VK_NULL_HANDLE};
+    VkShaderModule gltfVertModule{VK_NULL_HANDLE};
 
     uint32_t frameIndex{0uz};
     std::vector<VkFence> fences;
@@ -170,6 +194,41 @@ struct State{
     bool enable_input = true;
 
     tinygltf::Model model;
+    tinygltf::TinyGLTF loader;
+    bool gltfLoaded = false;
+
+    struct TextureResource {
+        VkImage image{VK_NULL_HANDLE};
+        VkDeviceMemory memory{VK_NULL_HANDLE};
+        VkImageView view{VK_NULL_HANDLE};
+        VkSampler sampler{VK_NULL_HANDLE};
+    };
+
+    struct MaterialRuntime {
+        MaterialParams params{};
+        int baseColorTextureIndex{-1};
+        int metallicRoughnessTextureIndex{-1};
+        int normalTextureIndex{-1};
+        int occlusionTextureIndex{-1};
+        int emissiveTextureIndex{-1};
+    };
+
+    struct DrawItem {
+        uint32_t firstVertex{0};
+        uint32_t vertexCount{0};
+        uint32_t materialIndex{0};
+    };
+
+    std::vector<TextureResource> gltfTexturesSrgb;
+    std::vector<TextureResource> gltfTexturesLinear;
+    TextureResource fallbackWhiteTexture{};
+    std::vector<MaterialRuntime> materials;
+    std::vector<DrawItem> drawItems;
+
+    VkDescriptorSetLayout materialDescriptorSetLayout{VK_NULL_HANDLE};
+    std::vector<VkDescriptorSet> materialDescriptorSets;
+    std::vector<VkBuffer> materialUniformBuffers;
+    std::vector<VkDeviceMemory> materialUniformBufferMemory;
 
     void initVulkan();
     void setExtensions();
@@ -188,6 +247,13 @@ struct State{
     void runRenderPass(uint32_t imgIdx, VkPipeline pipeline);
     void rebuildFragShader();
     void updateUniforms();
+    void loadGltfTextures();
+    void createFallbackTexture();
+    void createMaterialResources();
+    TextureResource createTexture2DFromRGBA(const unsigned char* rgba, uint32_t width, uint32_t height, VkFormat format);
+    void destroyTexture(TextureResource& texture);
+    void buildGltfPipeline();
+    void runRenderPassGltf(uint32_t imgIdx);
 
     void initSDL();
     void getInput();
@@ -429,6 +495,68 @@ void State::initFramebuffer(){
         VK_CHECK(vkCreateImageView(logicalDevice, &iCI, NULL, &swapchainImageViews[i]));
     }
 
+    auto findSupportedDepthFormat = [&]() -> VkFormat {
+        const std::array<VkFormat, 3> candidates = {
+            VK_FORMAT_D32_SFLOAT,
+            VK_FORMAT_D32_SFLOAT_S8_UINT,
+            VK_FORMAT_D24_UNORM_S8_UINT
+        };
+        for (VkFormat fmt : candidates) {
+            VkFormatProperties props{};
+            vkGetPhysicalDeviceFormatProperties(physicalDevice, fmt, &props);
+            if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+                return fmt;
+            }
+        }
+        return VK_FORMAT_D32_SFLOAT;
+    };
+    depthFormat = findSupportedDepthFormat();
+    depthImages.resize(swapchainImages.size());
+    depthImageMemory.resize(swapchainImages.size());
+    depthImageViews.resize(swapchainImages.size());
+
+    for (size_t i = 0; i < swapchainImages.size(); i++) {
+        VkImageCreateInfo depthImageCI = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = depthFormat,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        VK_CHECK(vkCreateImage(logicalDevice, &depthImageCI, nullptr, &depthImages[i]));
+
+        VkMemoryRequirements depthReqs{};
+        vkGetImageMemoryRequirements(logicalDevice, depthImages[i], &depthReqs);
+        VkMemoryAllocateInfo depthAlloc = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = depthReqs.size,
+            .memoryTypeIndex = findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthReqs.memoryTypeBits),
+        };
+        VK_CHECK(vkAllocateMemory(logicalDevice, &depthAlloc, nullptr, &depthImageMemory[i]));
+        VK_CHECK(vkBindImageMemory(logicalDevice, depthImages[i], depthImageMemory[i], 0));
+
+        VkImageViewCreateInfo depthViewCI = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = depthImages[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = depthFormat,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        VK_CHECK(vkCreateImageView(logicalDevice, &depthViewCI, nullptr, &depthImageViews[i]));
+    }
+
     renderCompleteSemaphores.resize(swapchainImages.size());
     VkSemaphoreCreateInfo sCI = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     for(auto& s : renderCompleteSemaphores)
@@ -455,9 +583,26 @@ void State::initFramebuffer(){
         .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR 
     };
     attachmentDescriptions.push_back(colorAttachment);
+
+    VkAttachmentDescription depthAttachment = {
+        .flags = 0,
+        .format = depthFormat,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    };
+    attachmentDescriptions.push_back(depthAttachment);
     VkAttachmentReference colorAttachmentReference = {
-        .attachment = static_cast<uint32_t>(attachmentDescriptions.size() - 1),
+        .attachment = 0,
         .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    };
+    VkAttachmentReference depthAttachmentReference = {
+        .attachment = 1,
+        .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
     };
 
     VkSubpassDescription subpassDescription = {
@@ -468,7 +613,7 @@ void State::initFramebuffer(){
         .colorAttachmentCount = 1,
         .pColorAttachments = &colorAttachmentReference,
         .pResolveAttachments = 0,
-        .pDepthStencilAttachment = 0,
+        .pDepthStencilAttachment = &depthAttachmentReference,
         .preserveAttachmentCount = 0,
         .pPreserveAttachments = 0,
     };
@@ -500,8 +645,9 @@ void State::initFramebuffer(){
 
     framebuffers.resize(swapchainImageViews.size());
     for(auto i{0uz}; i < framebuffers.size(); i++){
-        std::vector<VkImageView> imageViews = {
-            swapchainImageViews[i]
+        std::array<VkImageView, 2> imageViews = {
+            swapchainImageViews[i],
+            depthImageViews[i]
         };
 
         VkFramebufferCreateInfo fbCI = {
@@ -528,13 +674,357 @@ uint32_t State::findMemoryType(VkMemoryPropertyFlags f, uint32_t typeFilter){
 };
 
 #define MODEL_PATH "external/daybreak.glb"
+#define HELMET_PATH "external/DamagedHelmet.gltf"
 void State::initGltf(){
+    std::cout << "[+] Init GLTF" << std::endl;
+    std::string err = {}, warn = {};
+    bool ok = loader.LoadBinaryFromFile(&model, &err, &warn, MODEL_PATH);
+    //bool ok = loader.LoadASCIIFromFile(&model, &err, &warn, HELMET_PATH);
+    if(!warn.empty()) std::cout << warn << std::endl;
+    if(!err.empty()) std::cout << err << std::endl;
+    if (!ok) {
+        std::cerr << "[!] Failed to load glTF. Falling back to procedural geometry.\n";
+        return;
+    }
 
+    int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
+    if (sceneIndex < 0 || sceneIndex >= static_cast<int>(model.scenes.size())) {
+        std::cerr << "[!] glTF has no valid scene. Falling back to procedural geometry.\n";
+        return;
+    }
+
+    vertices.clear();
+    drawItems.clear();
+    materials.clear();
+    const tinygltf::Scene& scene = model.scenes[sceneIndex];
+    std::vector<GltfModel::PrimitiveRange> ranges;
+    for (int nodeIndex : scene.nodes) {
+        GltfModel::appendNodeMesh(model, nodeIndex, glm::mat4(1.0f), vertices, ranges);
+    }
+
+    if (vertices.empty()) {
+        std::cerr << "[!] glTF scene has no drawable vertices. Falling back to procedural geometry.\n";
+        return;
+    }
+
+    glm::vec3 minP(vertices[0].pos[0], vertices[0].pos[1], vertices[0].pos[2]);
+    glm::vec3 maxP = minP;
+    for (const auto& v : vertices) {
+        glm::vec3 p(v.pos[0], v.pos[1], v.pos[2]);
+        minP = glm::min(minP, p);
+        maxP = glm::max(maxP, p);
+    }
+    glm::vec3 center = (minP + maxP) * 0.5f;
+    glm::vec3 extents = maxP - minP;
+    float maxExtent = std::max(extents.x, std::max(extents.y, extents.z)) * 0.5f;
+    float scale = (maxExtent > 0.0f) ? (1.0f / maxExtent) : 1.0f;
+    for (auto& v : vertices) {
+        glm::vec3 p(v.pos[0], v.pos[1], v.pos[2]);
+        p = (p - center) * scale;
+        v.pos[0] = p.x;
+        v.pos[1] = p.y;
+        v.pos[2] = p.z;
+    }
+
+    camera.position = {2.5f, 0.0f, 0.0f};
+    camera.yaw = 180.0f;
+    camera.pitch = 0.0f;
+    camera.front = {-1.0f, 0.0f, 0.0f};
+    camera.up = {0.0f, 0.0f, 1.0f};
+
+    materials.reserve(model.materials.size() + 1);
+    for (const auto& mat : model.materials) {
+        MaterialRuntime runtimeMat{};
+        if (mat.values.find("baseColorFactor") != mat.values.end()) {
+            const auto& cf = mat.values.at("baseColorFactor").ColorFactor();
+            runtimeMat.params.baseColorFactor = glm::vec4(
+                static_cast<float>(cf[0]),
+                static_cast<float>(cf[1]),
+                static_cast<float>(cf[2]),
+                static_cast<float>(cf[3]));
+        }
+        if (mat.values.find("baseColorTexture") != mat.values.end()) {
+            runtimeMat.baseColorTextureIndex = mat.values.at("baseColorTexture").TextureIndex();
+            runtimeMat.params.hasBaseColorTexture = runtimeMat.baseColorTextureIndex >= 0 ? 1 : 0;
+        }
+        if (mat.values.find("metallicFactor") != mat.values.end()) {
+            runtimeMat.params.metallicFactor = static_cast<float>(mat.values.at("metallicFactor").Factor());
+        }
+        if (mat.values.find("roughnessFactor") != mat.values.end()) {
+            runtimeMat.params.roughnessFactor = static_cast<float>(mat.values.at("roughnessFactor").Factor());
+        }
+        if (mat.values.find("metallicRoughnessTexture") != mat.values.end()) {
+            runtimeMat.metallicRoughnessTextureIndex = mat.values.at("metallicRoughnessTexture").TextureIndex();
+            runtimeMat.params.hasMetallicRoughnessTexture = runtimeMat.metallicRoughnessTextureIndex >= 0 ? 1 : 0;
+        }
+
+        if (mat.additionalValues.find("normalTexture") != mat.additionalValues.end()) {
+            runtimeMat.normalTextureIndex = mat.additionalValues.at("normalTexture").TextureIndex();
+            runtimeMat.params.hasNormalTexture = runtimeMat.normalTextureIndex >= 0 ? 1 : 0;
+        }
+        if (mat.additionalValues.find("normalScale") != mat.additionalValues.end()) {
+            runtimeMat.params.normalScale = static_cast<float>(mat.additionalValues.at("normalScale").Factor());
+        }
+        if (mat.additionalValues.find("occlusionTexture") != mat.additionalValues.end()) {
+            runtimeMat.occlusionTextureIndex = mat.additionalValues.at("occlusionTexture").TextureIndex();
+            runtimeMat.params.hasOcclusionTexture = runtimeMat.occlusionTextureIndex >= 0 ? 1 : 0;
+        }
+        if (mat.additionalValues.find("occlusionStrength") != mat.additionalValues.end()) {
+            runtimeMat.params.occlusionStrength = static_cast<float>(mat.additionalValues.at("occlusionStrength").Factor());
+        }
+        if (mat.additionalValues.find("emissiveTexture") != mat.additionalValues.end()) {
+            runtimeMat.emissiveTextureIndex = mat.additionalValues.at("emissiveTexture").TextureIndex();
+            runtimeMat.params.hasEmissiveTexture = runtimeMat.emissiveTextureIndex >= 0 ? 1 : 0;
+        }
+        if (mat.additionalValues.find("emissiveFactor") != mat.additionalValues.end()) {
+            const auto& ef = mat.additionalValues.at("emissiveFactor").ColorFactor();
+            runtimeMat.params.emissiveFactor = glm::vec4(
+                static_cast<float>(ef[0]),
+                static_cast<float>(ef[1]),
+                static_cast<float>(ef[2]),
+                1.0f);
+        }
+        if (mat.additionalValues.find("alphaCutoff") != mat.additionalValues.end()) {
+            runtimeMat.params.alphaCutoff = static_cast<float>(mat.additionalValues.at("alphaCutoff").Factor());
+        }
+        if (mat.additionalValues.find("alphaMode") != mat.additionalValues.end()) {
+            const std::string mode = mat.additionalValues.at("alphaMode").string_value;
+            if (mode == "MASK") runtimeMat.params.alphaMode = 1;
+            else if (mode == "BLEND") runtimeMat.params.alphaMode = 2;
+            else runtimeMat.params.alphaMode = 0;
+        }
+        materials.push_back(runtimeMat);
+    }
+    if (materials.empty()) {
+        materials.push_back(MaterialRuntime{});
+    }
+
+    for (const auto& r : ranges) {
+        DrawItem d{};
+        d.firstVertex = r.firstVertex;
+        d.vertexCount = r.vertexCount;
+        d.materialIndex = (r.materialIndex >= 0 && r.materialIndex < static_cast<int>(materials.size()))
+            ? static_cast<uint32_t>(r.materialIndex)
+            : 0;
+        drawItems.push_back(d);
+    }
+    if (drawItems.empty()) {
+        drawItems.push_back({0u, static_cast<uint32_t>(vertices.size()), 0u});
+    }
+
+    loadGltfTextures();
+    createFallbackTexture();
+
+    gltfLoaded = true;
+    std::cout << "[+] Loaded " << vertices.size() << " glTF vertices and " << drawItems.size()
+              << " draw items from " << MODEL_PATH << std::endl;
 };
+
+State::TextureResource State::createTexture2DFromRGBA(const unsigned char* rgba, uint32_t texWidth, uint32_t texHeight, VkFormat format) {
+    TextureResource out{};
+    if (!rgba || texWidth == 0 || texHeight == 0) {
+        return out;
+    }
+
+    const VkDeviceSize imageSize = static_cast<VkDeviceSize>(texWidth) * texHeight * 4;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo bufferCI = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = imageSize,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VK_CHECK(vkCreateBuffer(logicalDevice, &bufferCI, nullptr, &stagingBuffer));
+
+    VkMemoryRequirements stagingReqs{};
+    vkGetBufferMemoryRequirements(logicalDevice, stagingBuffer, &stagingReqs);
+    VkMemoryAllocateInfo stagingAlloc = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = stagingReqs.size,
+        .memoryTypeIndex = findMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingReqs.memoryTypeBits),
+    };
+    VK_CHECK(vkAllocateMemory(logicalDevice, &stagingAlloc, nullptr, &stagingMemory));
+    VK_CHECK(vkBindBufferMemory(logicalDevice, stagingBuffer, stagingMemory, 0));
+
+    void* mapped = nullptr;
+    VK_CHECK(vkMapMemory(logicalDevice, stagingMemory, 0, imageSize, 0, &mapped));
+    std::memcpy(mapped, rgba, static_cast<size_t>(imageSize));
+    vkUnmapMemory(logicalDevice, stagingMemory);
+
+    VkImageCreateInfo imageCI = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = {texWidth, texHeight, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VK_CHECK(vkCreateImage(logicalDevice, &imageCI, nullptr, &out.image));
+
+    VkMemoryRequirements imageReqs{};
+    vkGetImageMemoryRequirements(logicalDevice, out.image, &imageReqs);
+    VkMemoryAllocateInfo imageAlloc = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = imageReqs.size,
+        .memoryTypeIndex = findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, imageReqs.memoryTypeBits),
+    };
+    VK_CHECK(vkAllocateMemory(logicalDevice, &imageAlloc, nullptr, &out.memory));
+    VK_CHECK(vkBindImageMemory(logicalDevice, out.image, out.memory, 0));
+
+    VkCommandBufferAllocateInfo cbAlloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = commandPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateCommandBuffers(logicalDevice, &cbAlloc, &cb));
+    VkCommandBufferBeginInfo cbBegin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VK_CHECK(vkBeginCommandBuffer(cb, &cbBegin));
+
+    VkImageMemoryBarrier toTransfer{};
+    toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransfer.srcAccessMask = 0;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = out.image;
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {texWidth, texHeight, 1};
+    vkCmdCopyBufferToImage(cb, stagingBuffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    VkImageMemoryBarrier toShaderRead{};
+    toShaderRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toShaderRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toShaderRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toShaderRead.image = out.image;
+    toShaderRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cb,
+    };
+    VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(queue));
+    vkFreeCommandBuffers(logicalDevice, commandPool, 1, &cb);
+
+    vkDestroyBuffer(logicalDevice, stagingBuffer, nullptr);
+    vkFreeMemory(logicalDevice, stagingMemory, nullptr);
+
+    VkImageViewCreateInfo viewCI = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = out.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = format,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    VK_CHECK(vkCreateImageView(logicalDevice, &viewCI, nullptr, &out.view));
+
+    VkSamplerCreateInfo samplerCI = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .maxAnisotropy = 1.0f,
+    };
+    VK_CHECK(vkCreateSampler(logicalDevice, &samplerCI, nullptr, &out.sampler));
+    return out;
+}
+
+void State::destroyTexture(TextureResource& texture) {
+    if (texture.sampler) vkDestroySampler(logicalDevice, texture.sampler, nullptr);
+    if (texture.view) vkDestroyImageView(logicalDevice, texture.view, nullptr);
+    if (texture.image) vkDestroyImage(logicalDevice, texture.image, nullptr);
+    if (texture.memory) vkFreeMemory(logicalDevice, texture.memory, nullptr);
+    texture = {};
+}
+
+void State::loadGltfTextures() {
+    gltfTexturesSrgb.clear();
+    gltfTexturesLinear.clear();
+    gltfTexturesSrgb.resize(model.textures.size());
+    gltfTexturesLinear.resize(model.textures.size());
+    for (size_t i = 0; i < model.textures.size(); i++) {
+        const tinygltf::Texture& tex = model.textures[i];
+        if (tex.source < 0 || tex.source >= static_cast<int>(model.images.size())) {
+            continue;
+        }
+        const tinygltf::Image& image = model.images[tex.source];
+        if (image.image.empty() || image.component < 3) {
+            continue;
+        }
+
+        std::vector<unsigned char> rgba;
+        const unsigned char* src = image.image.data();
+        if (image.component == 4) {
+            rgba.assign(src, src + image.width * image.height * 4);
+        } else {
+            rgba.resize(static_cast<size_t>(image.width) * image.height * 4);
+            for (int p = 0; p < image.width * image.height; p++) {
+                rgba[p * 4 + 0] = src[p * image.component + 0];
+                rgba[p * 4 + 1] = src[p * image.component + 1];
+                rgba[p * 4 + 2] = src[p * image.component + 2];
+                rgba[p * 4 + 3] = 255;
+            }
+        }
+        gltfTexturesSrgb[i] = createTexture2DFromRGBA(
+            rgba.data(),
+            static_cast<uint32_t>(image.width),
+            static_cast<uint32_t>(image.height),
+            VK_FORMAT_R8G8B8A8_SRGB);
+        gltfTexturesLinear[i] = createTexture2DFromRGBA(
+            rgba.data(),
+            static_cast<uint32_t>(image.width),
+            static_cast<uint32_t>(image.height),
+            VK_FORMAT_R8G8B8A8_UNORM);
+    }
+}
+
+void State::createFallbackTexture() {
+    const unsigned char white[4] = {255, 255, 255, 255};
+    fallbackWhiteTexture = createTexture2DFromRGBA(white, 1, 1, VK_FORMAT_R8G8B8A8_SRGB);
+}
 
 void State::initShaders(){
     const std::string fragPath = "artifacts/frag.spv";
     const std::string vertPath = "artifacts/vert.spv";
+    const std::string gltfFragSpv = "artifacts/new_gltf_frag.spv";
+    const std::string gltfVertSpv = "artifacts/gltf_vert.spv";
     std::cout << "[+] Creating Kernels" << std::endl;
     std::string cmd = "glslc \"" + static_cast<std::string>(shaderFragPath) + "\" -o \"" + fragPath + "\"";
 
@@ -563,21 +1053,31 @@ void State::initShaders(){
         .pCode = (const uint32_t*)code,
     };
     VK_CHECK(vkCreateShaderModule(logicalDevice, &sCI, NULL, &vertModule));
-
     free(code);
 
-    vertices = {
-        {{ 1.0, 1.0, 0.0},{1.0,1.0,1.0}},
-        {{-1.0, 1.0, 0.0},{1.0,1.0,1.0}},
-        {{-1.0,-1.0, 0.0},{1.0,1.0,1.0}},
-
-        {{ 1.0, 1.0, 0.0},{1.0,1.0,1.0}},
-        {{-1.0,-1.0, 0.0},{1.0,1.0,1.0}},
-        {{ 1.0,-1.0, 0.0},{1.0,1.0,1.0}},
+    cmd = "glslc \"" + static_cast<std::string>(gltfFragPath) + "\" -o \"" + gltfFragSpv + "\"";
+    std::system(cmd.c_str());
+    code = readFile(gltfFragSpv.c_str(), &codeSize);
+    sCI = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = codeSize,
+        .pCode = (const uint32_t*)code,
     };
-    if(enable_input){
-        vertices = GenerateSphere(1.0, 4, 32);
-    }
+    VK_CHECK(vkCreateShaderModule(logicalDevice, &sCI, NULL, &gltfFragModule));
+    free(code);
+
+    cmd = "glslc \"" + static_cast<std::string>(gltfVertPath) + "\" -o \"" + gltfVertSpv + "\"";
+    std::system(cmd.c_str());
+    code = readFile(gltfVertSpv.c_str(), &codeSize);
+    sCI = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = codeSize,
+        .pCode = (const uint32_t*)code,
+    };
+    VK_CHECK(vkCreateShaderModule(logicalDevice, &sCI, NULL, &gltfVertModule));
+    free(code);
+
+    if(vertices.empty()) vertices = GenerateSphere(1.0, 4, 32);
 
     vBindingDescription = {
         .binding = 0,
@@ -596,6 +1096,18 @@ void State::initShaders(){
             .binding = 0,
             .format = VK_FORMAT_R32G32B32_SFLOAT,
             .offset = offsetof(struct Vertex, color)
+        },
+        {
+            .location = 2,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = offsetof(struct Vertex, uv)
+        },
+        {
+            .location = 3,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = offsetof(struct Vertex, normal)
         }
     };
 
@@ -876,6 +1388,180 @@ void State::buildPipeline(VkShaderModule fragModule){
     VK_CHECK(vkCreateGraphicsPipelines(logicalDevice, NULL, 1, &gpCI, NULL, &shaderPipeline));
 };
 
+void State::buildGltfPipeline(){
+    VkPushConstantRange pcR = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(PushConstants),
+    };
+
+    VkDescriptorSetLayoutBinding frameBinding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+    };
+    VkDescriptorSetLayoutCreateInfo frameDslCI = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &frameBinding,
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(logicalDevice, &frameDslCI, nullptr, &uniformDescriptorSetLayout));
+
+    std::array<VkDescriptorSetLayoutBinding, 6> materialBindings = {{
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        {
+            .binding = 2,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        {
+            .binding = 3,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        {
+            .binding = 4,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        {
+            .binding = 5,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        }
+    }};
+    VkDescriptorSetLayoutCreateInfo materialDslCI = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = static_cast<uint32_t>(materialBindings.size()),
+        .pBindings = materialBindings.data(),
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(logicalDevice, &materialDslCI, nullptr, &materialDescriptorSetLayout));
+
+    std::array<VkDescriptorSetLayout, 2> pipelineLayouts = {
+        uniformDescriptorSetLayout,
+        materialDescriptorSetLayout
+    };
+    VkPipelineLayoutCreateInfo plCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = static_cast<uint32_t>(pipelineLayouts.size()),
+        .pSetLayouts = pipelineLayouts.data(),
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcR,
+    };
+    VK_CHECK(vkCreatePipelineLayout(logicalDevice, &plCI, nullptr, &gltfPipelineLayout));
+
+    viewport = {
+        .x = 0.0f,
+        .y = 0.0f,
+        .width = static_cast<float>(width),
+        .height = static_cast<float>(height),
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f
+    };
+    scissor = {
+        .offset = {0, 0},
+        .extent = {width, height}
+    };
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = gltfVertModule,
+            .pName = "main",
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = gltfFragModule,
+            .pName = "main",
+        }
+    };
+
+    VkPipelineVertexInputStateCreateInfo viCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &vBindingDescription,
+        .vertexAttributeDescriptionCount = static_cast<uint32_t>(vAttributeDescriptions.size()),
+        .pVertexAttributeDescriptions = vAttributeDescriptions.data(),
+    };
+    VkPipelineInputAssemblyStateCreateInfo iaCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+    VkPipelineViewportStateCreateInfo vpCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .pViewports = &viewport,
+        .scissorCount = 1,
+        .pScissors = &scissor,
+    };
+    VkPipelineRasterizationStateCreateInfo rsCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .lineWidth = 1.0f,
+    };
+    VkPipelineMultisampleStateCreateInfo msCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+    VkPipelineDepthStencilStateCreateInfo dsCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = VK_TRUE,
+        .depthWriteEnable = VK_TRUE,
+        .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
+        .depthBoundsTestEnable = VK_FALSE,
+        .stencilTestEnable = VK_FALSE,
+    };
+    VkPipelineColorBlendAttachmentState blend = {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    VkPipelineColorBlendStateCreateInfo cbCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &blend,
+    };
+    VkPipelineDynamicStateCreateInfo dynCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+    };
+
+    VkGraphicsPipelineCreateInfo gpCI = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &viCI,
+        .pInputAssemblyState = &iaCI,
+        .pViewportState = &vpCI,
+        .pRasterizationState = &rsCI,
+        .pMultisampleState = &msCI,
+        .pDepthStencilState = &dsCI,
+        .pColorBlendState = &cbCI,
+        .pDynamicState = &dynCI,
+        .layout = gltfPipelineLayout,
+        .renderPass = renderPass,
+        .subpass = 0,
+    };
+    VK_CHECK(vkCreateGraphicsPipelines(logicalDevice, VK_NULL_HANDLE, 1, &gpCI, nullptr, &gltfPipeline));
+}
+
 void State::initResources(){
     std::cout << "[+] Creating Resources" << std::endl;
     VkCommandPoolCreateInfo cpCI = {
@@ -906,7 +1592,7 @@ void State::initVulkan(){
     initResources();
     initGltf();
     initShaders();
-    buildPipeline(fragModule);
+    buildGltfPipeline();
     initUniforms();
 }
 
@@ -1012,7 +1698,8 @@ void State::initUniforms(){
         {{1.0f, 0.0f, 0.0f, 0.0f}, 
          {0.0f, 1.0f, 0.0f, 0.0f}, 
          {0.0f, 0.0f, 1.0f, 0.0f}, 
-         {0.0f, 0.0f, 0.0f, 1.0f}}
+         {0.0f, 0.0f, 0.0f, 1.0f}},
+        {0.0f, 0.0f, 0.0f, 1.0f}
     };
 
     VkBufferCreateInfo bCI = {
@@ -1044,18 +1731,24 @@ void State::initUniforms(){
         vkMapMemory(logicalDevice, uniformBufferMemory[i], 0, sizeof(MVP), 0, &uniformBufferMapped[i]);
     }
 
-    VkDescriptorPoolSize poolSize = {
-        .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = static_cast<uint32_t>(swapchainImages.size()),
-    };
+    std::array<VkDescriptorPoolSize, 2> poolSizes = {{
+        {
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = static_cast<uint32_t>(swapchainImages.size() + materials.size()),
+        },
+        {
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = static_cast<uint32_t>(5 * std::max<size_t>(1, materials.size())),
+        }
+    }};
 
     VkDescriptorPoolCreateInfo poolCI = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = NULL,
         .flags = 0,
-        .maxSets = static_cast<uint32_t>(swapchainImages.size()),
-        .poolSizeCount = 1,
-        .pPoolSizes = &poolSize,
+        .maxSets = static_cast<uint32_t>(swapchainImages.size() + std::max<size_t>(1, materials.size())),
+        .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
+        .pPoolSizes = poolSizes.data(),
     };
     vkCreateDescriptorPool(logicalDevice, &poolCI, NULL, &descriptorPool);
 
@@ -1089,6 +1782,133 @@ void State::initUniforms(){
         };
         vkUpdateDescriptorSets(logicalDevice, 1, &write, 0, NULL);
     }
+
+    createMaterialResources();
+}
+
+void State::createMaterialResources() {
+    if (materials.empty()) {
+        materials.push_back(MaterialRuntime{});
+    }
+
+    materialUniformBuffers.resize(materials.size());
+    materialUniformBufferMemory.resize(materials.size());
+    materialDescriptorSets.resize(materials.size());
+
+    VkBufferCreateInfo bufferCI = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = sizeof(MaterialParams),
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    for (size_t i = 0; i < materials.size(); i++) {
+        VkMemoryRequirements req{};
+        VK_CHECK(vkCreateBuffer(logicalDevice, &bufferCI, nullptr, &materialUniformBuffers[i]));
+        vkGetBufferMemoryRequirements(logicalDevice, materialUniformBuffers[i], &req);
+        VkMemoryAllocateInfo alloc = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = req.size,
+            .memoryTypeIndex = findMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, req.memoryTypeBits),
+        };
+        VK_CHECK(vkAllocateMemory(logicalDevice, &alloc, nullptr, &materialUniformBufferMemory[i]));
+        VK_CHECK(vkBindBufferMemory(logicalDevice, materialUniformBuffers[i], materialUniformBufferMemory[i], 0));
+        void* mapped = nullptr;
+        VK_CHECK(vkMapMemory(logicalDevice, materialUniformBufferMemory[i], 0, sizeof(MaterialParams), 0, &mapped));
+        std::memcpy(mapped, &materials[i].params, sizeof(MaterialParams));
+        vkUnmapMemory(logicalDevice, materialUniformBufferMemory[i]);
+    }
+
+    std::vector<VkDescriptorSetLayout> layouts(materials.size(), materialDescriptorSetLayout);
+    VkDescriptorSetAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptorPool,
+        .descriptorSetCount = static_cast<uint32_t>(layouts.size()),
+        .pSetLayouts = layouts.data(),
+    };
+    VK_CHECK(vkAllocateDescriptorSets(logicalDevice, &allocInfo, materialDescriptorSets.data()));
+
+    for (size_t i = 0; i < materials.size(); i++) {
+        VkDescriptorBufferInfo bufferInfo = {
+            .buffer = materialUniformBuffers[i],
+            .offset = 0,
+            .range = sizeof(MaterialParams),
+        };
+
+        auto pickTexture = [&](int texIndex, bool srgb) -> const TextureResource* {
+            const auto& table = srgb ? gltfTexturesSrgb : gltfTexturesLinear;
+            if (texIndex >= 0 && texIndex < static_cast<int>(table.size()) && table[texIndex].view != VK_NULL_HANDLE) {
+                return &table[texIndex];
+            }
+            return &fallbackWhiteTexture;
+        };
+
+        const TextureResource* baseColorTex = pickTexture(materials[i].baseColorTextureIndex, true);
+        const TextureResource* metallicRoughnessTex = pickTexture(materials[i].metallicRoughnessTextureIndex, false);
+        const TextureResource* normalTex = pickTexture(materials[i].normalTextureIndex, false);
+        const TextureResource* occlusionTex = pickTexture(materials[i].occlusionTextureIndex, false);
+        const TextureResource* emissiveTex = pickTexture(materials[i].emissiveTextureIndex, true);
+
+        std::array<VkDescriptorImageInfo, 5> imageInfos = {{
+            { baseColorTex->sampler, baseColorTex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { metallicRoughnessTex->sampler, metallicRoughnessTex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { normalTex->sampler, normalTex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { occlusionTex->sampler, occlusionTex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            { emissiveTex->sampler, emissiveTex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }
+        }};
+
+        std::array<VkWriteDescriptorSet, 6> writes = {{
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = materialDescriptorSets[i],
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &bufferInfo,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = materialDescriptorSets[i],
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &imageInfos[0],
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = materialDescriptorSets[i],
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &imageInfos[1],
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = materialDescriptorSets[i],
+                .dstBinding = 3,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &imageInfos[2],
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = materialDescriptorSets[i],
+                .dstBinding = 4,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &imageInfos[3],
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = materialDescriptorSets[i],
+                .dstBinding = 5,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &imageInfos[4],
+            }
+        }};
+        vkUpdateDescriptorSets(logicalDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
 }
 
 static void printMat4(const glm::mat4& m)
@@ -1103,8 +1923,7 @@ static void printMat4(const glm::mat4& m)
     }
 }
 
-void printMVP(const MVP& mvp)
-{
+void printMVP(const MVP& mvp){
     std::cout << "Model:\n";
     printMat4(mvp.model);
 
@@ -1118,9 +1937,11 @@ void printMVP(const MVP& mvp)
 void State::updateUniforms(){
     if(enable_input){
     mvp.model = glm::mat4(1.0);
-    float angle = glm::radians(90.0f);
-    glm::vec3 axis = {0.0, 0.0, 1.0};
-    mvp.model = glm::rotate(mvp.model, angle, axis);
+    if (gltfLoaded) {
+        float angle = glm::radians(90.0f);
+        glm::vec3 axis = {1.0f, 0.0f, 0.0f};
+        mvp.model = glm::rotate(mvp.model, angle, axis);
+    }
 
     glm::vec3 worldUp = {0.0, 0.0, 1.0};
     glm::vec3 right = glm::normalize(glm::cross(camera.front, worldUp));
@@ -1135,10 +1956,12 @@ void State::updateUniforms(){
     float farZ = 100.0f;
     mvp.proj = glm::perspective(fovy, aspect, nearZ, farZ);
     mvp.proj[1][1] *= -1;
+    mvp.camPos = glm::vec4(camera.position, 1.0f);
     } else {
     mvp.model = glm::mat4(1.0);
     mvp.view  = glm::mat4(1.0);
     mvp.proj  = glm::mat4(1.0);
+    mvp.camPos = glm::vec4(0.0f, 0.0f, 2.5f, 1.0f);
     }
     memcpy(uniformBufferMapped[frameIndex], &mvp, sizeof(mvp));
     //printMVP(mvp);
@@ -1153,7 +1976,7 @@ void State::runRenderPass(uint32_t imgIdx, VkPipeline pipeline){
     };
     VkClearValue clearColor[2] = {0};
     clearColor[0].color = (VkClearColorValue){{0.05f, 0.15f, 0.20f, 1.0f}};
-    clearColor[1].depthStencil = (VkClearDepthStencilValue){1.0f, 0}; 
+    clearColor[1].depthStencil = {1.0f, 0};
     VkRenderPassBeginInfo rpBI = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .pNext = NULL,
@@ -1178,6 +2001,47 @@ void State::runRenderPass(uint32_t imgIdx, VkPipeline pipeline){
     vkCmdBindDescriptorSets(commandBuffers[frameIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, shaderPipelineLayout,
             0, 1, &descriptorSets[frameIndex], 0, NULL);
     vkCmdDraw(commandBuffers[frameIndex], vertices.size(), 1, 0, 0);
+
+    vkCmdEndRenderPass(commandBuffers[frameIndex]);
+    vkEndCommandBuffer(commandBuffers[frameIndex]);
+}
+
+void State::runRenderPassGltf(uint32_t imgIdx){
+    VkCommandBufferBeginInfo cbCI = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+    };
+    VkClearValue clearColor[2] = {0};
+    clearColor[0].color = (VkClearColorValue){{0.05f, 0.15f, 0.20f, 1.0f}};
+    clearColor[1].depthStencil = {1.0f, 0};
+    VkRenderPassBeginInfo rpBI = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = renderPass,
+        .framebuffer = framebuffers[imgIdx],
+        .renderArea = {{0,0},{width, height}},
+        .clearValueCount = sizeof(clearColor)/sizeof(VkClearValue),
+        .pClearValues = clearColor
+    };
+
+    vkBeginCommandBuffer(commandBuffers[frameIndex], &cbCI);
+    vkCmdBeginRenderPass(commandBuffers[frameIndex], &rpBI, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(commandBuffers[frameIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, gltfPipeline);
+
+    PushConstants pc = {{static_cast<float>(width), static_cast<float>(height)}, runtime.count(), 0.0f};
+    vkCmdPushConstants(commandBuffers[frameIndex], gltfPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
+
+    VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffers[frameIndex], 0, 1, &vertexBuffer, offsets);
+    vkCmdBindDescriptorSets(commandBuffers[frameIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, gltfPipelineLayout,
+            0, 1, &descriptorSets[frameIndex], 0, nullptr);
+
+    for (const auto& draw : drawItems) {
+        if (draw.materialIndex >= materialDescriptorSets.size()) {
+            continue;
+        }
+        vkCmdBindDescriptorSets(commandBuffers[frameIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, gltfPipelineLayout,
+                1, 1, &materialDescriptorSets[draw.materialIndex], 0, nullptr);
+        vkCmdDraw(commandBuffers[frameIndex], draw.vertexCount, 1, draw.firstVertex, 0);
+    }
 
     vkCmdEndRenderPass(commandBuffers[frameIndex]);
     vkEndCommandBuffer(commandBuffers[frameIndex]);
@@ -1212,8 +2076,11 @@ void State::rebuildFragShader(){
 
 void State::appLogic(){
     getInput();
-    fs::file_time_type shaderTs = getFileTimestamp(shaderFragPath);
-    if(shaderTs != fs::file_time_type::min() && shaderTs > fragTs){
+    if (gltfLoaded) {
+        return;
+    }
+    std::filesystem::file_time_type shaderTs = getFileTimestamp(shaderFragPath);
+    if(shaderTs != std::filesystem::file_time_type::min() && shaderTs > fragTs){
         std::cout << "file has been written" << std::endl;
         fragTs = shaderTs;
         rebuildFragShader();
@@ -1234,7 +2101,7 @@ void State::renderLoop(){
         vkResetCommandBuffer(commandBuffers[frameIndex], 0);
 
         updateUniforms();
-        runRenderPass(imgIdx, shaderPipeline);
+        runRenderPassGltf(imgIdx);
 
         VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
         VkSubmitInfo submitInfo = {
@@ -1289,23 +2156,47 @@ void State::exit(){
     for(size_t i{0u}; i<swapchainImages.size(); i++){
         vkDestroyFramebuffer(logicalDevice, framebuffers[i], NULL);
         vkDestroyImageView(logicalDevice, swapchainImageViews[i], NULL);
+        vkDestroyImageView(logicalDevice, depthImageViews[i], NULL);
+        vkDestroyImage(logicalDevice, depthImages[i], NULL);
+        vkFreeMemory(logicalDevice, depthImageMemory[i], NULL);
         vkDestroyFence(logicalDevice, fences[i], NULL);
         vkDestroySemaphore(logicalDevice, imageAvailableSemaphores[i], NULL);
         vkDestroySemaphore(logicalDevice, renderCompleteSemaphores[i], NULL);
         vkUnmapMemory(logicalDevice, uniformBufferMemory[i]);
+        vkDestroyBuffer(logicalDevice, uniformBuffers[i], nullptr);
+        vkFreeMemory(logicalDevice, uniformBufferMemory[i], nullptr);
     };
     vkDestroySwapchainKHR(logicalDevice, swapchain, NULL);
     SDL_DestroyWindow(window);
+
+    for (size_t i = 0; i < materialUniformBuffers.size(); i++) {
+        if (materialUniformBuffers[i]) vkDestroyBuffer(logicalDevice, materialUniformBuffers[i], nullptr);
+        if (materialUniformBufferMemory[i]) vkFreeMemory(logicalDevice, materialUniformBufferMemory[i], nullptr);
+    }
+    for (auto& t : gltfTexturesSrgb) {
+        destroyTexture(t);
+    }
+    for (auto& t : gltfTexturesLinear) {
+        destroyTexture(t);
+    }
+    destroyTexture(fallbackWhiteTexture);
 
     vkDestroyBuffer(logicalDevice, vertexBuffer, NULL);
     vkFreeMemory(logicalDevice, vertexBufferMemory, NULL);
 
     vkDestroyPipeline(logicalDevice, shaderPipeline, NULL);
+    vkDestroyPipeline(logicalDevice, gltfPipeline, NULL);
     vkDestroyPipelineLayout(logicalDevice, shaderPipelineLayout, NULL);
+    vkDestroyPipelineLayout(logicalDevice, gltfPipelineLayout, NULL);
+    vkDestroyDescriptorSetLayout(logicalDevice, materialDescriptorSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(logicalDevice, uniformDescriptorSetLayout, nullptr);
+    vkDestroyDescriptorPool(logicalDevice, descriptorPool, nullptr);
 
     vkDestroyRenderPass(logicalDevice, renderPass, NULL);
     vkDestroyShaderModule(logicalDevice, fragModule, NULL);
     vkDestroyShaderModule(logicalDevice, vertModule, NULL);
+    vkDestroyShaderModule(logicalDevice, gltfFragModule, NULL);
+    vkDestroyShaderModule(logicalDevice, gltfVertModule, NULL);
 
     vkFreeCommandBuffers(logicalDevice, commandPool, commandBuffers.size(), commandBuffers.data());
     vkDestroyCommandPool(logicalDevice, commandPool, NULL);

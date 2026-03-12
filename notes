@@ -1,0 +1,67 @@
+  1. Add a glTF loader layer
+
+  - Use tinygltf to parse .gltf/.glb.
+  - Extract: nodes, meshes, primitives, accessors, bufferViews, materials, textures.
+
+  2. Change geometry path from “single procedural mesh” to “many primitives”
+
+  - glTF mesh = multiple primitives.
+  - Each primitive has its own vertex/index ranges + material.
+  - Your draw loop becomes for node -> for primitive -> vkCmdDrawIndexed(...).
+
+  3. Expand vertex format
+
+  - At minimum for glTF:
+      - POSITION (required)
+      - NORMAL (optional but usually needed)
+      - TEXCOORD_0 (for baseColorTexture)
+      - COLOR_0 (optional, but common)
+  - Keep missing attributes with defaults in shader/CPU.
+
+  4. Add index buffer support (required in practice)
+
+  - Most glTF primitives are indexed.
+  - Support index component types: UNSIGNED_SHORT and UNSIGNED_INT (and ideally
+    UNSIGNED_BYTE).
+
+  5. Add node transform handling
+
+  - glTF is hierarchical.
+  - Compute world matrix from parent*local and pass per-draw (push constants or SSBO index).
+
+  6. Add minimal material system
+
+  - Support pbrMetallicRoughness.baseColorFactor.
+  - Support baseColorTexture (sRGB sampled image).
+  - Bind per-material descriptors (or material buffer + texture array later).
+
+  7. Update shaders
+
+  - New vertex shader: position/normal/uv/color + MVP/world.
+  - New fragment shader: baseColorFactor * texture(baseColorTexture) * vertexColor.
+  - Keep simple directional+ambient lighting for now.
+
+  8. Pipelines
+
+  - Start with one pipeline (opaque).
+  - Then add variants as needed:
+      - alpha blend (alphaMode=BLEND)
+      - alpha mask (alphaMode=MASK with discard)
+      - double-sided (cull off)
+
+  9. Passes
+
+  - Single render pass is enough for minimal glTF.
+  - Multiple passes are only needed later for advanced PBR/IBL/shadows/post.
+
+  So for your direct questions:
+
+  - “Just vertex/index upload?” -> Not enough; also scene graph + materials + textures + per-
+    primitive draw logic.
+  - “Set number of pipelines?” -> 1 initially, then 2-4 variants for alpha/cull correctness.
+  - “Multiple shaders?” -> At least one glTF-aware VS+FS pair; more only for variants.
+  - “Multiple passes?” -> No, one pass is fine for minimal support.
+
+  If you want, next I can give you a concrete integration skeleton (GltfModel, GltfPrimitive,
+  GltfMaterial, and exact command buffer pseudocode) mapped to your current
+  State::buildPipeline style.

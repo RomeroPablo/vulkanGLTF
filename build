@@ -9,7 +9,7 @@ if [ artifacts/shaders -ot main.cpp ] || [ artifacts/shaders -ot lib.hpp ]; then
     mkdir -p artifacts
     echo "compiling..."
     bear --output artifacts/compile_commands.json -- \
-        g++ -std=c++23 -g -O0 main.cpp -lvulkan $(sdl2-config --cflags --libs) \
+        g++ -std=c++23 -g -O0 -Wno-deprecated-literal-operator main.cpp -lvulkan $(sdl2-config --cflags --libs) \
         -o artifacts/shaders
 fi
 

@@ -1,0 +1,20 @@
+[
+  {
+    "file": "main.cpp",
+    "arguments": [
+      "g++",
+      "-std=c++23",
+      "-g",
+      "-O0",
+      "-Wno-deprecated-literal-operator",
+      "main.cpp",
+      "-I/usr/include/SDL2",
+      "-D_GNU_SOURCE=1",
+      "-D_REENTRANT",
+      "-o",
+      "artifacts/shaders"
+    ],
+    "directory": "/home/pablo/documents/vulkanGLTF",
+    "output": "artifacts/shaders"
+  }
+]

@@ -421,6 +421,8 @@ void inline printPresentMode(const VkPresentModeKHR p){
 struct Vertex {
     float pos[3];
     float color[3];
+    float uv[2];
+    float normal[3];
 };
 
 inline std::vector<Vertex> GenerateSphere(
@@ -457,10 +459,10 @@ inline std::vector<Vertex> GenerateSphere(
             float y11 = radius * std::cos(theta1);
             float z11 = radius * std::sin(theta1) * std::sin(phi1);
 
-            Vertex v00{{x00,y00,z00},{r,g,b}};
-            Vertex v01{{x01,y01,z01},{r,g,b}};
-            Vertex v10{{x10,y10,z10},{r,g,b}};
-            Vertex v11{{x11,y11,z11},{r,g,b}};
+            Vertex v00{{x00,y00,z00},{r,g,b},{0.0f,0.0f},{x00,y00,z00}};
+            Vertex v01{{x01,y01,z01},{r,g,b},{0.0f,0.0f},{x01,y01,z01}};
+            Vertex v10{{x10,y10,z10},{r,g,b},{0.0f,0.0f},{x10,y10,z10}};
+            Vertex v11{{x11,y11,z11},{r,g,b},{0.0f,0.0f},{x11,y11,z11}};
 
             vertices.push_back(v00);
             vertices.push_back(v10);
