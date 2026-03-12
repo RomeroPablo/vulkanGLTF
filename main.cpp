@@ -88,12 +88,14 @@ struct alignas(16) MaterialParams {
 struct State{
     const char* shaderFragPath = "kernels/shader.frag";
     const char* shaderVertPath = "kernels/shader.vert";
-    const char* gltfFragPath = "kernels/new_gltf.frag";
+    const char* gltfFragPath = "kernels/gltf.frag";
     const char* gltfVertPath = "kernels/gltf.vert";
+    const char* postFragPath = "kernels/postProcess.frag";
+    const char* postVertPath = "kernels/postProcess.vert";
     std::filesystem::file_time_type fragTs{};
     SDL_Window* window;
-    uint32_t width = 3840;
-    uint32_t height = 2160;
+    uint32_t width = 1280;
+    uint32_t height = 720;
     bool running = true;
     std::chrono::time_point<std::chrono::steady_clock> tStart{}, tEnd{};
     std::chrono::duration<float> runtime{};
@@ -132,16 +134,25 @@ struct State{
     std::vector<VkImageView> depthImageViews;
 
     VkRenderPass renderPass;
+    VkRenderPass postRenderPass{VK_NULL_HANDLE};
     std::vector<VkAttachmentDescription> attachmentDescriptions;
     std::vector<VkSubpassDescription> subpassDescriptions;
     std::vector<VkSubpassDependency> subpassDependencies;
 
     std::vector<VkFramebuffer> framebuffers;
+    std::vector<VkFramebuffer> postFramebuffers;
+
+    std::vector<VkImage> offscreenColorImages;
+    std::vector<VkDeviceMemory> offscreenColorImageMemory;
+    std::vector<VkImageView> offscreenColorImageViews;
+    VkSampler offscreenColorSampler{VK_NULL_HANDLE};
 
     VkPipelineLayout shaderPipelineLayout{VK_NULL_HANDLE};
     VkPipeline shaderPipeline{VK_NULL_HANDLE};
     VkPipelineLayout gltfPipelineLayout{VK_NULL_HANDLE};
     VkPipeline gltfPipeline{VK_NULL_HANDLE};
+    VkPipelineLayout postPipelineLayout{VK_NULL_HANDLE};
+    VkPipeline postPipeline{VK_NULL_HANDLE};
 
     VkViewport viewport;
     VkRect2D scissor;
@@ -150,6 +161,8 @@ struct State{
     VkShaderModule vertModule;
     VkShaderModule gltfFragModule{VK_NULL_HANDLE};
     VkShaderModule gltfVertModule{VK_NULL_HANDLE};
+    VkShaderModule postFragModule{VK_NULL_HANDLE};
+    VkShaderModule postVertModule{VK_NULL_HANDLE};
 
     uint32_t frameIndex{0uz};
     std::vector<VkFence> fences;
@@ -229,6 +242,8 @@ struct State{
     std::vector<VkDescriptorSet> materialDescriptorSets;
     std::vector<VkBuffer> materialUniformBuffers;
     std::vector<VkDeviceMemory> materialUniformBufferMemory;
+    VkDescriptorSetLayout postDescriptorSetLayout{VK_NULL_HANDLE};
+    std::vector<VkDescriptorSet> postDescriptorSets;
 
     void initVulkan();
     void setExtensions();
@@ -253,6 +268,7 @@ struct State{
     TextureResource createTexture2DFromRGBA(const unsigned char* rgba, uint32_t width, uint32_t height, VkFormat format);
     void destroyTexture(TextureResource& texture);
     void buildGltfPipeline();
+    void buildPostPipeline();
     void runRenderPassGltf(uint32_t imgIdx);
 
     void initSDL();
@@ -571,6 +587,67 @@ void State::initFramebuffer(){
     for(auto& f : fences)
         VK_CHECK(vkCreateFence(logicalDevice, &fCI, NULL, &f));
 
+    offscreenColorImages.resize(swapchainImages.size());
+    offscreenColorImageMemory.resize(swapchainImages.size());
+    offscreenColorImageViews.resize(swapchainImages.size());
+    for (size_t i = 0; i < swapchainImages.size(); i++) {
+        VkImageCreateInfo imageCI = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = swapchainImageFormat,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        VK_CHECK(vkCreateImage(logicalDevice, &imageCI, nullptr, &offscreenColorImages[i]));
+
+        VkMemoryRequirements memReqs{};
+        vkGetImageMemoryRequirements(logicalDevice, offscreenColorImages[i], &memReqs);
+        VkMemoryAllocateInfo alloc = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = memReqs.size,
+            .memoryTypeIndex = findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReqs.memoryTypeBits),
+        };
+        VK_CHECK(vkAllocateMemory(logicalDevice, &alloc, nullptr, &offscreenColorImageMemory[i]));
+        VK_CHECK(vkBindImageMemory(logicalDevice, offscreenColorImages[i], offscreenColorImageMemory[i], 0));
+
+        VkImageViewCreateInfo viewCI = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = offscreenColorImages[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = swapchainImageFormat,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        VK_CHECK(vkCreateImageView(logicalDevice, &viewCI, nullptr, &offscreenColorImageViews[i]));
+    }
+
+    VkSamplerCreateInfo samplerCI = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxAnisotropy = 1.0f,
+    };
+    VK_CHECK(vkCreateSampler(logicalDevice, &samplerCI, nullptr, &offscreenColorSampler));
+
+    attachmentDescriptions.clear();
+    subpassDescriptions.clear();
+    subpassDependencies.clear();
+
     VkAttachmentDescription colorAttachment = {
         .flags = 0,
         .format = swapchainImageFormat,
@@ -580,7 +657,7 @@ void State::initFramebuffer(){
         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR 
+        .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
     };
     attachmentDescriptions.push_back(colorAttachment);
 
@@ -596,6 +673,7 @@ void State::initFramebuffer(){
         .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
     };
     attachmentDescriptions.push_back(depthAttachment);
+
     VkAttachmentReference colorAttachmentReference = {
         .attachment = 0,
         .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
@@ -604,18 +682,11 @@ void State::initFramebuffer(){
         .attachment = 1,
         .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
     };
-
     VkSubpassDescription subpassDescription = {
-        .flags = 0,
         .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .inputAttachmentCount = 0,
-        .pInputAttachments = NULL,
         .colorAttachmentCount = 1,
         .pColorAttachments = &colorAttachmentReference,
-        .pResolveAttachments = 0,
         .pDepthStencilAttachment = &depthAttachmentReference,
-        .preserveAttachmentCount = 0,
-        .pPreserveAttachments = 0,
     };
     subpassDescriptions.push_back(subpassDescription);
 
@@ -631,9 +702,7 @@ void State::initFramebuffer(){
     subpassDependencies.push_back(subpassDependency);
 
     VkRenderPassCreateInfo rpCI = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, 
-        .pNext = NULL,
-        .flags = 0,
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
         .attachmentCount = static_cast<uint32_t>(attachmentDescriptions.size()),
         .pAttachments = attachmentDescriptions.data(),
         .subpassCount = static_cast<uint32_t>(subpassDescriptions.size()),
@@ -641,27 +710,75 @@ void State::initFramebuffer(){
         .dependencyCount = static_cast<uint32_t>(subpassDependencies.size()),
         .pDependencies = subpassDependencies.data()
     };
-    VK_CHECK(vkCreateRenderPass(logicalDevice, &rpCI, NULL, &renderPass));
+    VK_CHECK(vkCreateRenderPass(logicalDevice, &rpCI, nullptr, &renderPass));
 
-    framebuffers.resize(swapchainImageViews.size());
-    for(auto i{0uz}; i < framebuffers.size(); i++){
-        std::array<VkImageView, 2> imageViews = {
-            swapchainImageViews[i],
+    VkAttachmentDescription postColorAttachment = {
+        .flags = 0,
+        .format = swapchainImageFormat,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+    };
+    VkAttachmentReference postColorRef = {
+        .attachment = 0,
+        .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    };
+    VkSubpassDescription postSubpass = {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &postColorRef,
+    };
+    VkSubpassDependency postDep = {
+        .srcSubpass = VK_SUBPASS_EXTERNAL,
+        .dstSubpass = 0,
+        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    };
+    VkRenderPassCreateInfo postRpCI = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &postColorAttachment,
+        .subpassCount = 1,
+        .pSubpasses = &postSubpass,
+        .dependencyCount = 1,
+        .pDependencies = &postDep,
+    };
+    VK_CHECK(vkCreateRenderPass(logicalDevice, &postRpCI, nullptr, &postRenderPass));
+
+    framebuffers.resize(swapchainImages.size());
+    postFramebuffers.resize(swapchainImages.size());
+    for (size_t i = 0; i < swapchainImages.size(); i++) {
+        std::array<VkImageView, 2> sceneViews = {
+            offscreenColorImageViews[i],
             depthImageViews[i]
         };
-
-        VkFramebufferCreateInfo fbCI = {
+        VkFramebufferCreateInfo sceneFbCI = {
             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .pNext = NULL,
-            .flags = 0,
             .renderPass = renderPass,
-            .attachmentCount = static_cast<uint32_t>(imageViews.size()),
-            .pAttachments = imageViews.data(),
+            .attachmentCount = static_cast<uint32_t>(sceneViews.size()),
+            .pAttachments = sceneViews.data(),
             .width = width,
             .height = height,
             .layers = 1,
         };
-        VK_CHECK(vkCreateFramebuffer(logicalDevice, &fbCI, NULL, &framebuffers[i]));
+        VK_CHECK(vkCreateFramebuffer(logicalDevice, &sceneFbCI, nullptr, &framebuffers[i]));
+
+        VkFramebufferCreateInfo postFbCI = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = postRenderPass,
+            .attachmentCount = 1,
+            .pAttachments = &swapchainImageViews[i],
+            .width = width,
+            .height = height,
+            .layers = 1,
+        };
+        VK_CHECK(vkCreateFramebuffer(logicalDevice, &postFbCI, nullptr, &postFramebuffers[i]));
     }
 };
 
@@ -1023,8 +1140,10 @@ void State::createFallbackTexture() {
 void State::initShaders(){
     const std::string fragPath = "artifacts/frag.spv";
     const std::string vertPath = "artifacts/vert.spv";
-    const std::string gltfFragSpv = "artifacts/new_gltf_frag.spv";
+    const std::string gltfFragSpv = "artifacts/gltf_frag.spv";
     const std::string gltfVertSpv = "artifacts/gltf_vert.spv";
+    const std::string postFragSpv = "artifacts/postProcess_frag.spv";
+    const std::string postVertSpv = "artifacts/postProcess.spv";
     std::cout << "[+] Creating Kernels" << std::endl;
     std::string cmd = "glslc \"" + static_cast<std::string>(shaderFragPath) + "\" -o \"" + fragPath + "\"";
 
@@ -1075,6 +1194,28 @@ void State::initShaders(){
         .pCode = (const uint32_t*)code,
     };
     VK_CHECK(vkCreateShaderModule(logicalDevice, &sCI, NULL, &gltfVertModule));
+    free(code);
+
+    cmd = "glslc \"" + static_cast<std::string>(postFragPath) + "\" -o \"" + postFragSpv + "\"";
+    std::system(cmd.c_str());
+    code = readFile(postFragSpv.c_str(), &codeSize);
+    sCI = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = codeSize,
+        .pCode = (const uint32_t*)code,
+    };
+    VK_CHECK(vkCreateShaderModule(logicalDevice, &sCI, NULL, &postFragModule));
+    free(code);
+
+    cmd = "glslc \"" + static_cast<std::string>(postVertPath) + "\" -o \"" + postVertSpv + "\"";
+    std::system(cmd.c_str());
+    code = readFile(postVertSpv.c_str(), &codeSize);
+    sCI = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = codeSize,
+        .pCode = (const uint32_t*)code,
+    };
+    VK_CHECK(vkCreateShaderModule(logicalDevice, &sCI, NULL, &postVertModule));
     free(code);
 
     if(vertices.empty()) vertices = GenerateSphere(1.0, 4, 32);
@@ -1562,6 +1703,119 @@ void State::buildGltfPipeline(){
     VK_CHECK(vkCreateGraphicsPipelines(logicalDevice, VK_NULL_HANDLE, 1, &gpCI, nullptr, &gltfPipeline));
 }
 
+void State::buildPostPipeline() {
+    VkPushConstantRange pcR = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(PushConstants),
+    };
+
+    VkDescriptorSetLayoutBinding postBinding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    VkDescriptorSetLayoutCreateInfo postDslCI = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &postBinding,
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(logicalDevice, &postDslCI, nullptr, &postDescriptorSetLayout));
+
+    VkPipelineLayoutCreateInfo plCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &postDescriptorSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcR,
+    };
+    VK_CHECK(vkCreatePipelineLayout(logicalDevice, &plCI, nullptr, &postPipelineLayout));
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = postVertModule,
+            .pName = "main",
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = postFragModule,
+            .pName = "main",
+        }
+    };
+
+    VkPipelineVertexInputStateCreateInfo viCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = nullptr,
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = nullptr,
+    };
+    VkPipelineInputAssemblyStateCreateInfo iaCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+    VkPipelineViewportStateCreateInfo vpCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .pViewports = &viewport,
+        .scissorCount = 1,
+        .pScissors = &scissor,
+    };
+    VkPipelineRasterizationStateCreateInfo rsCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .lineWidth = 1.0f,
+    };
+    VkPipelineMultisampleStateCreateInfo msCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+    VkPipelineDepthStencilStateCreateInfo dsCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = VK_FALSE,
+        .depthWriteEnable = VK_FALSE,
+        .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+        .depthBoundsTestEnable = VK_FALSE,
+        .stencilTestEnable = VK_FALSE,
+    };
+    VkPipelineColorBlendAttachmentState blend = {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    VkPipelineColorBlendStateCreateInfo cbCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &blend,
+    };
+    VkPipelineDynamicStateCreateInfo dynCI = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+    };
+
+    VkGraphicsPipelineCreateInfo gpCI = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &viCI,
+        .pInputAssemblyState = &iaCI,
+        .pViewportState = &vpCI,
+        .pRasterizationState = &rsCI,
+        .pMultisampleState = &msCI,
+        .pDepthStencilState = &dsCI,
+        .pColorBlendState = &cbCI,
+        .pDynamicState = &dynCI,
+        .layout = postPipelineLayout,
+        .renderPass = postRenderPass,
+        .subpass = 0,
+    };
+    VK_CHECK(vkCreateGraphicsPipelines(logicalDevice, VK_NULL_HANDLE, 1, &gpCI, nullptr, &postPipeline));
+}
+
 void State::initResources(){
     std::cout << "[+] Creating Resources" << std::endl;
     VkCommandPoolCreateInfo cpCI = {
@@ -1593,6 +1847,7 @@ void State::initVulkan(){
     initGltf();
     initShaders();
     buildGltfPipeline();
+    buildPostPipeline();
     initUniforms();
 }
 
@@ -1738,7 +1993,7 @@ void State::initUniforms(){
         },
         {
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = static_cast<uint32_t>(5 * std::max<size_t>(1, materials.size())),
+            .descriptorCount = static_cast<uint32_t>(5 * std::max<size_t>(1, materials.size()) + swapchainImages.size()),
         }
     }};
 
@@ -1746,7 +2001,7 @@ void State::initUniforms(){
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = NULL,
         .flags = 0,
-        .maxSets = static_cast<uint32_t>(swapchainImages.size() + std::max<size_t>(1, materials.size())),
+        .maxSets = static_cast<uint32_t>(2 * swapchainImages.size() + std::max<size_t>(1, materials.size())),
         .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
         .pPoolSizes = poolSizes.data(),
     };
@@ -1784,6 +2039,33 @@ void State::initUniforms(){
     }
 
     createMaterialResources();
+
+    std::vector<VkDescriptorSetLayout> postLayouts(swapchainImages.size(), postDescriptorSetLayout);
+    VkDescriptorSetAllocateInfo postAllocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptorPool,
+        .descriptorSetCount = static_cast<uint32_t>(postLayouts.size()),
+        .pSetLayouts = postLayouts.data(),
+    };
+    postDescriptorSets.resize(swapchainImages.size());
+    VK_CHECK(vkAllocateDescriptorSets(logicalDevice, &postAllocInfo, postDescriptorSets.data()));
+
+    for (size_t i = 0; i < swapchainImages.size(); i++) {
+        VkDescriptorImageInfo imageInfo = {
+            .sampler = offscreenColorSampler,
+            .imageView = offscreenColorImageViews[i],
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        };
+        VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = postDescriptorSets[i],
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &imageInfo,
+        };
+        vkUpdateDescriptorSets(logicalDevice, 1, &write, 0, nullptr);
+    }
 }
 
 void State::createMaterialResources() {
@@ -2010,20 +2292,31 @@ void State::runRenderPassGltf(uint32_t imgIdx){
     VkCommandBufferBeginInfo cbCI = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     };
-    VkClearValue clearColor[2] = {0};
-    clearColor[0].color = (VkClearColorValue){{0.05f, 0.15f, 0.20f, 1.0f}};
-    clearColor[1].depthStencil = {1.0f, 0};
-    VkRenderPassBeginInfo rpBI = {
+    VkClearValue sceneClear[2] = {0};
+    sceneClear[0].color = (VkClearColorValue){{0.00f, 0.00f, 0.00f, 1.0f}};
+    sceneClear[1].depthStencil = {1.0f, 0};
+    VkRenderPassBeginInfo sceneRpBI = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = renderPass,
         .framebuffer = framebuffers[imgIdx],
         .renderArea = {{0,0},{width, height}},
-        .clearValueCount = sizeof(clearColor)/sizeof(VkClearValue),
-        .pClearValues = clearColor
+        .clearValueCount = sizeof(sceneClear)/sizeof(VkClearValue),
+        .pClearValues = sceneClear
+    };
+
+    VkClearValue postClear = {};
+    postClear.color = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}};
+    VkRenderPassBeginInfo postRpBI = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = postRenderPass,
+        .framebuffer = postFramebuffers[imgIdx],
+        .renderArea = {{0,0},{width, height}},
+        .clearValueCount = 1,
+        .pClearValues = &postClear
     };
 
     vkBeginCommandBuffer(commandBuffers[frameIndex], &cbCI);
-    vkCmdBeginRenderPass(commandBuffers[frameIndex], &rpBI, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(commandBuffers[frameIndex], &sceneRpBI, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(commandBuffers[frameIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, gltfPipeline);
 
     PushConstants pc = {{static_cast<float>(width), static_cast<float>(height)}, runtime.count(), 0.0f};
@@ -2044,6 +2337,15 @@ void State::runRenderPassGltf(uint32_t imgIdx){
     }
 
     vkCmdEndRenderPass(commandBuffers[frameIndex]);
+
+    vkCmdBeginRenderPass(commandBuffers[frameIndex], &postRpBI, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(commandBuffers[frameIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, postPipeline);
+    vkCmdPushConstants(commandBuffers[frameIndex], postPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
+    vkCmdBindDescriptorSets(commandBuffers[frameIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, postPipelineLayout,
+            0, 1, &postDescriptorSets[imgIdx], 0, nullptr);
+    vkCmdDraw(commandBuffers[frameIndex], 3, 1, 0, 0);
+    vkCmdEndRenderPass(commandBuffers[frameIndex]);
+
     vkEndCommandBuffer(commandBuffers[frameIndex]);
 }
 
@@ -2155,7 +2457,11 @@ int main(){
 void State::exit(){
     for(size_t i{0u}; i<swapchainImages.size(); i++){
         vkDestroyFramebuffer(logicalDevice, framebuffers[i], NULL);
+        vkDestroyFramebuffer(logicalDevice, postFramebuffers[i], NULL);
         vkDestroyImageView(logicalDevice, swapchainImageViews[i], NULL);
+        vkDestroyImageView(logicalDevice, offscreenColorImageViews[i], NULL);
+        vkDestroyImage(logicalDevice, offscreenColorImages[i], NULL);
+        vkFreeMemory(logicalDevice, offscreenColorImageMemory[i], NULL);
         vkDestroyImageView(logicalDevice, depthImageViews[i], NULL);
         vkDestroyImage(logicalDevice, depthImages[i], NULL);
         vkFreeMemory(logicalDevice, depthImageMemory[i], NULL);
@@ -2186,17 +2492,24 @@ void State::exit(){
 
     vkDestroyPipeline(logicalDevice, shaderPipeline, NULL);
     vkDestroyPipeline(logicalDevice, gltfPipeline, NULL);
+    vkDestroyPipeline(logicalDevice, postPipeline, NULL);
     vkDestroyPipelineLayout(logicalDevice, shaderPipelineLayout, NULL);
     vkDestroyPipelineLayout(logicalDevice, gltfPipelineLayout, NULL);
+    vkDestroyPipelineLayout(logicalDevice, postPipelineLayout, NULL);
     vkDestroyDescriptorSetLayout(logicalDevice, materialDescriptorSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(logicalDevice, postDescriptorSetLayout, nullptr);
     vkDestroyDescriptorSetLayout(logicalDevice, uniformDescriptorSetLayout, nullptr);
     vkDestroyDescriptorPool(logicalDevice, descriptorPool, nullptr);
+    vkDestroySampler(logicalDevice, offscreenColorSampler, nullptr);
 
     vkDestroyRenderPass(logicalDevice, renderPass, NULL);
+    vkDestroyRenderPass(logicalDevice, postRenderPass, NULL);
     vkDestroyShaderModule(logicalDevice, fragModule, NULL);
     vkDestroyShaderModule(logicalDevice, vertModule, NULL);
     vkDestroyShaderModule(logicalDevice, gltfFragModule, NULL);
     vkDestroyShaderModule(logicalDevice, gltfVertModule, NULL);
+    vkDestroyShaderModule(logicalDevice, postFragModule, NULL);
+    vkDestroyShaderModule(logicalDevice, postVertModule, NULL);
 
     vkFreeCommandBuffers(logicalDevice, commandPool, commandBuffers.size(), commandBuffers.data());
     vkDestroyCommandPool(logicalDevice, commandPool, NULL);

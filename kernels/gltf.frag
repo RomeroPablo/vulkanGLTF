@@ -104,6 +104,9 @@ void main() {
     }
 
     vec3 V = normalize(ubo.camPos.xyz - vertWorldPos);
+    float angle = pc.u_time * 1.0;
+    vec3 L = normalize(vec3(cos(angle), sin(angle), 0.8));
+    /*
     float angleZ = pc.u_time * 0.7;
     float angleY = pc.u_time * 0.45;
     vec3 L0 = normalize(vec3(1.0, 0.0, 0.8));
@@ -118,6 +121,7 @@ void main() {
         -sin(angleY), 0.0, cos(angleY)
     );
     vec3 L = normalize(rotY * (rotZ * L0));
+    */
     vec3 H = normalize(V + L);
 
     float metallic = clamp(material.metallicFactor, 0.0, 1.0);
@@ -141,9 +145,9 @@ void main() {
     vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
     float NdotL = max(dot(N, L), 0.0);
 
-    vec3 radiance = vec3(1.0);
+    vec3 radiance = vec3(2.5);
     vec3 Lo = (kD * albedo / PI + specular) * radiance * NdotL;
-    vec3 ambient = vec3(0.04) * albedo;
+    vec3 ambient = vec3(0.02) * albedo;
 
     if (material.hasOcclusionTexture != 0) {
         float ao = texture(occlusionTex, vertUV).r;
