@@ -5,12 +5,45 @@
 #include <iostream>
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_core.h>
+#include <glm/glm.hpp>
+#include <filesystem>
 
 #define VK_CHECK(x) do { VkResult err = x; if (err) { \
     std::cout << "Detected Vulkan error: " << err << " at " \
     << __FILE__ << ":" << __LINE__ << std::endl; \
     abort(); \
 } } while(0)
+
+
+static std::filesystem::file_time_type getFileTimestamp(const char* path) {
+    std::error_code ec;
+    std::filesystem::file_time_type ts = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return std::filesystem::file_time_type::min();
+    }
+    return ts;
+}
+
+struct alignas(16) MVP {
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+    glm::vec4 camPos;
+};
+
+struct PushConstants{
+    float resolution[2];
+    float time;
+    float _pad;
+};
+
+inline uint32_t findMemoryType(VkPhysicalDeviceMemoryProperties& memoryProperties, VkMemoryPropertyFlags f, uint32_t typeFilter){
+    for(uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++){
+        if((typeFilter & (1 << i)) && (memoryProperties.memoryTypes[i].propertyFlags & f) == f)
+            return i;
+    }
+    return UINT32_MAX;
+};
 
 inline unsigned char* readFile(const char* path, size_t* size){
     FILE* file = fopen(path, "rb");

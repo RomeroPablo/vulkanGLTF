@@ -1,17 +1,17 @@
 #!/bin/sh
 
 if [ "$1" = "clean" ]; then
-    rm -rf artifacts shaders
+    rm -rf artifacts gltf
     exit 0
 fi
 
-if [ artifacts/shaders -ot main.cpp ] || [ artifacts/shaders -ot lib.hpp ]; then
+if [ gltf -ot main.cpp ] || [ gltf -ot lib.hpp ] || [ gltf -ot gltf.cpp ] || [ gltf -ot gltf.hpp ]; then
     mkdir -p artifacts
     echo "compiling..."
     bear --output artifacts/compile_commands.json -- \
-        g++ -std=c++23 -g -O0 -Wno-deprecated-literal-operator main.cpp -lvulkan $(sdl2-config --cflags --libs) \
-        -o artifacts/shaders
+        g++ -std=c++23 -g -O0 -Wno-deprecated-literal-operator main.cpp gltf.cpp -lvulkan $(sdl2-config --cflags --libs) \
+        -o artifacts/gltf
 fi
 
-mv ./artifacts/shaders .
-./shaders
+mv ./artifacts/gltf .
+./gltf
